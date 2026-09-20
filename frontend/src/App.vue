@@ -67,7 +67,70 @@
         </div>
         <div class="bg-slate-800 rounded-lg p-4 border border-slate-700">
           <h3 class="text-sm font-bold text-slate-400 mb-3">光强分布曲线</h3>
-          <canvas ref="intensityRef" class="w-full rounded" style="height: 200px; background: #0f172a;"></canvas>
+          <canvas ref="intensityRef" class="w-full rounded" style="height: 200px; background: #0f172a;"
+            :style="{ cursor: store.currentExperiment === 'single' ? 'crosshair' : 'default' }"
+            @click="onIntensityClick"></canvas>
+          <p v-if="store.currentExperiment === 'single'" class="text-xs text-slate-500 mt-2">点击曲线标记中央亮区左右边界（最多 2 点）</p>
+        </div>
+        <div v-if="store.currentExperiment === 'single'" class="bg-slate-800 rounded-lg p-4 border border-slate-700 space-y-3">
+          <h3 class="text-sm font-bold text-slate-400">中央亮纹测量辅助</h3>
+          <div class="flex flex-wrap items-center gap-2 text-xs">
+            <span class="text-slate-500">当前标记：</span>
+            <span v-if="!store.marks.length" class="text-slate-600">暂无（在上方光强曲线上点击添加）</span>
+            <span v-for="(m, i) in store.marks" :key="m.id"
+              class="inline-flex items-center gap-1 bg-slate-900 border border-yellow-500/40 text-yellow-300 rounded px-2 py-0.5">
+              边界{{ i + 1 }}: {{ m.position.toFixed(2) }} mm
+              <button @click="store.removeMark(m.id)" class="text-slate-500 hover:text-red-400">✕</button>
+            </span>
+            <span v-if="store.marks.length === 2" class="text-cyan-300">
+              标记宽度 = {{ (store.marks[1].position - store.marks[0].position).toFixed(2) }} mm
+            </span>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <select v-model="criterion" class="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300">
+              <option v-for="opt in criterionOptions" :key="opt.id" :value="opt.id">{{ opt.name }}</option>
+            </select>
+            <input v-model="recordName" placeholder="记录名称（留空自动命名）"
+              class="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs text-slate-300 w-44" />
+            <button @click="onGenerateRecord"
+              class="bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold rounded px-3 py-1 transition-colors">
+              生成中央宽记录
+            </button>
+          </div>
+          <div v-if="measureMsg"
+            :class="['text-xs rounded px-2 py-1 border', measureMsg.ok ? 'bg-green-900/40 text-green-300 border-green-700' : 'bg-red-900/40 text-red-300 border-red-700']">
+            {{ measureMsg.text }}
+          </div>
+          <div v-if="store.records.length" class="overflow-x-auto">
+            <table class="w-full text-xs text-slate-300">
+              <thead>
+                <tr class="text-slate-500 border-b border-slate-700">
+                  <th class="text-left py-1 pr-2">名称</th>
+                  <th class="px-1">λ (nm)</th>
+                  <th class="px-1">a (μm)</th>
+                  <th class="px-1">L (mm)</th>
+                  <th class="px-1">判定条件</th>
+                  <th class="px-1">测量宽 (mm)</th>
+                  <th class="px-1">理论宽 (mm)</th>
+                  <th class="px-1">偏差 (%)</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="rec in store.records" :key="rec.name" class="border-b border-slate-800 text-center">
+                  <td class="text-left py-1 pr-2 text-cyan-300">{{ rec.name }}</td>
+                  <td>{{ rec.wavelength }}</td>
+                  <td>{{ rec.slitWidth }}</td>
+                  <td>{{ rec.screenDistance }}</td>
+                  <td>{{ rec.criterionLabel }}</td>
+                  <td class="text-yellow-300">{{ rec.measuredWidth.toFixed(2) }}</td>
+                  <td>{{ rec.theoreticalWidth.toFixed(2) }}</td>
+                  <td :class="Math.abs(rec.deviation) <= 5 ? 'text-green-400' : 'text-orange-400'">{{ rec.deviation.toFixed(2) }}</td>
+                  <td><button @click="store.removeRecord(rec.name)" class="text-slate-500 hover:text-red-400">删除</button></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
         <div class="bg-slate-800 rounded-lg p-4 border border-slate-700">
           <h3 class="text-sm font-bold text-slate-400 mb-3">2D 热力图</h3>
@@ -80,12 +143,56 @@
 
 <script setup lang="ts">
 import { ref, onMounted, watch } from 'vue'
-import { useOpticsStore } from './store/optics'
+import {
+  useOpticsStore, CRITERION_LABELS, MIN_MEASURABLE_WIDTH_MM,
+  type Criterion, type MarkFailure, type RecordFailure,
+} from './store/optics'
 
 const store = useOpticsStore()
 const patternRef = ref<HTMLCanvasElement | null>(null)
 const intensityRef = ref<HTMLCanvasElement | null>(null)
 const heatmapRef = ref<HTMLCanvasElement | null>(null)
+
+const criterion = ref<Criterion>('first-minimum')
+const recordName = ref('')
+const measureMsg = ref<{ ok: boolean; text: string } | null>(null)
+
+const criterionOptions = (Object.keys(CRITERION_LABELS) as Criterion[]).map(id => ({ id, name: CRITERION_LABELS[id] }))
+
+const MARK_ERROR_TEXT: Record<MarkFailure, string> = {
+  'not-single': '仅单缝衍射实验支持边界标记',
+  'limit': '最多标记 2 个边界点，请先删除已有标记',
+  'duplicate': '边界点重复：该位置附近已有标记，未覆盖原标记',
+}
+const RECORD_ERROR_TEXT: Record<RecordFailure, string> = {
+  'not-single': '仅单缝衍射实验支持生成中央宽记录',
+  'need-two-marks': '需要先在光强曲线上标记左右两个边界点',
+  'duplicate-boundary': '两个边界点重复，无法构成有效宽度',
+  'below-threshold': `边界间距未达到可测阈值（≥ ${MIN_MEASURABLE_WIDTH_MM} mm），未生成记录`,
+  'name-conflict': '记录名称已存在，未覆盖已有记录，请更换名称',
+}
+
+function onIntensityClick(e: MouseEvent) {
+  if (store.currentExperiment !== 'single') return
+  const canvas = intensityRef.value
+  if (!canvas) return
+  const rect = canvas.getBoundingClientRect()
+  const pos = ((e.clientX - rect.left) / rect.width - 0.5) * 40 // 横轴 ±20 mm
+  const res = store.addMark(pos)
+  measureMsg.value = res.ok
+    ? { ok: true, text: `已标记边界点：${(Math.round(pos * 100) / 100).toFixed(2)} mm` }
+    : { ok: false, text: MARK_ERROR_TEXT[res.reason] }
+}
+
+function onGenerateRecord() {
+  const res = store.generateRecord(recordName.value, criterion.value)
+  if (res.ok) {
+    measureMsg.value = { ok: true, text: `已生成「${res.record.name}」：测量宽 ${res.record.measuredWidth.toFixed(2)} mm，理论宽 ${res.record.theoreticalWidth.toFixed(2)} mm` }
+    recordName.value = ''
+  } else {
+    measureMsg.value = { ok: false, text: RECORD_ERROR_TEXT[res.reason] }
+  }
+}
 
 const experiments = [
   { id: 'double', name: '双缝干涉 (Young实验)' },
@@ -154,6 +261,26 @@ function drawIntensity() {
   ctx.setLineDash([])
   ctx.fillStyle = '#94a3b8'; ctx.font = '10px monospace'; ctx.textAlign = 'center'
   ctx.fillText('0', W / 2, H - 2); ctx.fillText('光强 I', 30, 12); ctx.fillText('位置 x', W - 20, H - 2)
+  // 中央亮区边界标记（仅单缝衍射）
+  if (store.currentExperiment === 'single') {
+    const ms = store.marks
+    if (ms.length === 2) {
+      const x1 = (ms[0].position / 40 + 0.5) * W
+      const x2 = (ms[1].position / 40 + 0.5) * W
+      ctx.fillStyle = 'rgba(250, 204, 21, 0.08)'
+      ctx.fillRect(Math.min(x1, x2), 0, Math.abs(x2 - x1), H)
+    }
+    ms.forEach((m, i) => {
+      const x = (m.position / 40 + 0.5) * W
+      ctx.strokeStyle = '#facc15'; ctx.lineWidth = 1.5; ctx.setLineDash([6, 4])
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke()
+      ctx.setLineDash([])
+      ctx.fillStyle = '#facc15'; ctx.font = '11px monospace'
+      ctx.textAlign = x > W / 2 ? 'right' : 'left'
+      ctx.fillText(`边界${i + 1} ${m.position.toFixed(2)}mm`, x + (x > W / 2 ? -4 : 4), 14 + i * 13)
+    })
+    ctx.textAlign = 'center'
+  }
 }
 
 function drawHeatmap() {
@@ -183,4 +310,5 @@ function renderAll() { drawPattern(); drawIntensity(); drawHeatmap() }
 
 onMounted(() => { store.compute(); setTimeout(renderAll, 100) })
 watch(() => store.intensityData, () => renderAll(), { deep: true })
+watch(() => store.marks, () => drawIntensity(), { deep: true })
 </script>
